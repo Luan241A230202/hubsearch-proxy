@@ -38,28 +38,56 @@ serve(async (req: Request) => {
     headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     headers.set("Accept", "application/json, text/html, */*");
 
-    // Bơm Referer giả định cho Upload18/321watch tránh 403 / Bot Fight Mode
+    // Bơm Referer giả định cho Upload18/321watch tránh 403 / Bot Fight Mode (TLS Fingerprint)
+    let body: any;
+    let finalStatus = 200;
+    const responseHeaders = new Headers();
+    responseHeaders.set('Access-Control-Allow-Origin', '*');
+
     if (targetUrl.includes('321watch.workers.dev') || targetUrl.includes('upload18.org')) {
-        headers.set("Referer", "https://upload18.org/");
-        headers.set("Origin", "https://upload18.org");
+        // Sử dụng curl.exe/curl qua subprocess để vượt qua TLS Fingerprinting chặn fetch() của Deno
+        const command = new Deno.Command("curl", {
+          args: [
+            "-sL", // silent, follow redirects
+            "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-H", "Referer: https://upload18.org/",
+            "-H", "Origin: https://upload18.org",
+            targetUrl
+          ],
+          stdout: "piped",
+          stderr: "piped"
+        });
+        
+        const child = command.spawn();
+        body = child.stdout;
+        
+        // Cần truyền Content-Type đúng nếu là m3u8 hay ảnh
+        if (targetUrl.includes('.m3u8') || targetUrl.includes('token_hash')) {
+          responseHeaders.set('Content-Type', 'application/vnd.apple.mpegurl');
+        } else if (targetUrl.includes('.png')) {
+          responseHeaders.set('Content-Type', 'image/png');
+        } else if (targetUrl.includes('.jpeg') || targetUrl.includes('.jpg')) {
+          responseHeaders.set('Content-Type', 'image/jpeg');
+        } else {
+          responseHeaders.set('Content-Type', 'application/octet-stream');
+        }
+    } else {
+        // Web khác thì fetch bình thường
+        const targetResponse = await fetch(targetUrl, {
+          method: req.method,
+          headers: headers
+        })
+        body = await targetResponse.blob();
+        finalStatus = targetResponse.status;
+        targetResponse.headers.forEach((value, key) => {
+          if (key.toLowerCase() !== 'report-to' && key.toLowerCase() !== 'nel' && key.toLowerCase() !== 'access-control-allow-origin') {
+            responseHeaders.set(key, value);
+          }
+        });
     }
 
-    const targetResponse = await fetch(targetUrl, {
-      method: req.method,
-      headers: headers
-    })
-
-    const body = await targetResponse.blob()
-    
-    const responseHeaders = new Headers(targetResponse.headers)
-    responseHeaders.set('Access-Control-Allow-Origin', '*')
-    
-    // Gỡ các headers khai báo của máy chủ gốc
-    responseHeaders.delete('Report-To')
-    responseHeaders.delete('NEL')
-
     return new Response(body, {
-      status: targetResponse.status,
+      status: finalStatus,
       headers: responseHeaders,
     })
   } catch (error: any) {
