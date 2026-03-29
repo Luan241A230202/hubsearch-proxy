@@ -6,7 +6,7 @@ const API_KEY = Deno.env.get("PROXY_API_KEY") || "VIP_KHOABAM_999";
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-api-key, x-proxy-key',
 }
 
 serve(async (req: Request) => {
@@ -17,10 +17,19 @@ serve(async (req: Request) => {
   try {
     const url = new URL(req.url)
     const targetUrl = url.searchParams.get('url')
-    const key = url.searchParams.get('key') || req.headers.get('x-api-key')
+    const key = url.searchParams.get('key') || req.headers.get('x-api-key') || req.headers.get('x-proxy-key')
+    
+    // Also support base64-encoded token param 't' (used by m3u8 segments)
+    let authKey = key;
+    if (!authKey) {
+      const tokenParam = url.searchParams.get('t');
+      if (tokenParam) {
+        try { authKey = atob(tokenParam); } catch {}
+      }
+    }
 
     // BẢO MẬT BẰNG API KEY
-    if (key !== API_KEY) {
+    if (authKey !== API_KEY) {
       return new Response("Unauthorized Proxy Gateway - Invalid API Key", { 
         status: 401, 
         headers: corsHeaders 
