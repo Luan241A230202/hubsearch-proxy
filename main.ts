@@ -2,9 +2,18 @@
 // Anh có thể đặt thẳng ở đây hoặc cấu hình ENV trên Coolify
 const API_KEY = Deno.env.get("PROXY_API_KEY") || "VIP_KHOABAM_999";
 
-// ====== IN-MEMORY SEGMENT CACHE ======
+// ====== R2 PERSISTENT CACHE ======
+// R2 Worker URL — set after deploying R2 worker
+// Use custom domain for CDN caching (e.g., r2.vnhell.com)
+const R2_WORKER_URL = Deno.env.get("R2_WORKER_URL") || '';
+// Set of keys known to exist in R2 (avoids HEAD requests)
+const r2KnownKeys = new Set<string>();
+let r2Uploads = 0;
+let r2Hits = 0;
+
+// ====== IN-MEMORY SEGMENT CACHE (L1) ======
 // Cache segments from 321watch to reduce upstream requests
-// - Max 150 entries (~300MB RAM max assuming ~2MB/segment)
+// - Max 500 entries (~750MB RAM)
 // - TTL: 2 hours (segments don't change)
 // - LRU eviction: oldest entries removed first
 const CACHE_MAX_ENTRIES = 500;
@@ -81,6 +90,29 @@ const corsHeaders = {
   'Access-Control-Max-Age': '86400', // Cache CORS preflight 24h → reduce 50% CF requests
 }
 
+// ====== R2 HELPER FUNCTIONS ======
+async function r2Upload(key: string, data: Uint8Array, contentType: string): Promise<boolean> {
+  if (!R2_WORKER_URL) return false;
+  try {
+    const resp = await fetch(`${R2_WORKER_URL}/${key}`, {
+      method: 'PUT',
+      headers: { 'X-Auth': API_KEY, 'Content-Type': contentType },
+      body: data,
+    });
+    if (resp.ok) {
+      r2KnownKeys.add(key);
+      r2Uploads++;
+      return true;
+    }
+  } catch { /* ignore R2 upload failures — memory cache still works */ }
+  return false;
+}
+
+function getR2Url(key: string): string | null {
+  if (!R2_WORKER_URL || !r2KnownKeys.has(key)) return null;
+  return `${R2_WORKER_URL}/${key}`;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
@@ -114,15 +146,24 @@ Deno.serve(async (req: Request) => {
       return new Response(JSON.stringify({
         status: "ok",
         cache: {
-          entries: segmentCache.size,
-          maxEntries: CACHE_MAX_ENTRIES,
-          totalSizeMB: (totalSize / 1024 / 1024).toFixed(1),
-          hits: cacheHits,
-          misses: cacheMisses,
-          evictions: cacheEvictions,
-          hitRate: cacheHits + cacheMisses > 0 
-            ? ((cacheHits / (cacheHits + cacheMisses)) * 100).toFixed(1) + '%' 
-            : '0%',
+          L1_memory: {
+            entries: segmentCache.size,
+            maxEntries: CACHE_MAX_ENTRIES,
+            totalSizeMB: (totalSize / 1024 / 1024).toFixed(1),
+            hits: cacheHits,
+            misses: cacheMisses,
+            evictions: cacheEvictions,
+            hitRate: cacheHits + cacheMisses > 0 
+              ? ((cacheHits / (cacheHits + cacheMisses)) * 100).toFixed(1) + '%' 
+              : '0%',
+          },
+          L2_r2: {
+            enabled: !!R2_WORKER_URL,
+            workerUrl: R2_WORKER_URL || 'not configured',
+            knownKeys: r2KnownKeys.size,
+            uploads: r2Uploads,
+            hits: r2Hits,
+          },
         }
       }, null, 2), { 
         status: 200, 
@@ -134,17 +175,19 @@ Deno.serve(async (req: Request) => {
     headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     headers.set("Accept", "application/json, text/html, */*");
 
-    // ====== CHECK CACHE for segments ======
+    // ====== CHECK CACHE for segments (L1 Memory → L2 R2 → Origin) ======
     if (isSegmentUrl(targetUrl)) {
       const cacheKey = getCacheKey(targetUrl);
-      const cached = cacheGet(cacheKey);
       
+      // L1: Check memory cache
+      const cached = cacheGet(cacheKey);
       if (cached) {
         cacheHits++;
         const responseHeaders = new Headers();
         responseHeaders.set('Access-Control-Allow-Origin', '*');
         responseHeaders.set('Content-Type', cached.contentType);
-        responseHeaders.set('X-Cache', 'HIT');
+        responseHeaders.set('X-Cache', 'HIT-L1');
+        responseHeaders.set('X-Cache-Layer', 'memory');
         responseHeaders.set('X-Cache-Entries', segmentCache.size.toString());
         responseHeaders.set('Cache-Control', 'public, max-age=7200');
         
@@ -152,6 +195,13 @@ Deno.serve(async (req: Request) => {
           status: 200,
           headers: responseHeaders,
         });
+      }
+      
+      // L2: Redirect to R2 if known (CDN cached → 0 BW on this VPS)
+      const r2Url = getR2Url(cacheKey);
+      if (r2Url) {
+        r2Hits++;
+        return Response.redirect(r2Url, 302);
       }
       
       cacheMisses++;
@@ -192,17 +242,21 @@ Deno.serve(async (req: Request) => {
         }
         responseHeaders.set('Content-Type', contentType);
         
-        // For segments: collect output and cache it
+        // For segments: collect output, cache in L1 (memory) + L2 (R2)
         if (isSegmentUrl(targetUrl)) {
           const output = await child.output();
           const data = output.stdout;
           
           if (data.byteLength > 0) {
-            // Cache the segment
+            // L1: Cache in memory
             const cacheKey = getCacheKey(targetUrl);
             cachePut(cacheKey, data, contentType);
             
+            // L2: Upload to R2 in background (non-blocking)
+            r2Upload(cacheKey, data, contentType);
+            
             responseHeaders.set('X-Cache', 'MISS');
+            responseHeaders.set('X-Cache-Layer', 'origin');
             responseHeaders.set('X-Cache-Entries', segmentCache.size.toString());
             responseHeaders.set('Cache-Control', 'public, max-age=7200');
             
