@@ -2,14 +2,21 @@
 // Anh có thể đặt thẳng ở đây hoặc cấu hình ENV trên Coolify
 const API_KEY = Deno.env.get("PROXY_API_KEY") || "VIP_KHOABAM_999";
 
-// ====== R2 PERSISTENT CACHE ======
-// R2 Worker URL — set after deploying R2 worker
-// Use custom domain for CDN caching (e.g., r2.vnhell.com)
-const R2_WORKER_URL = Deno.env.get("R2_WORKER_URL") || '';
+// ====== R2 PERSISTENT CACHE (L2) — S3 API Direct ======
+// Coolify PUT trực tiếp vào R2 qua S3 API (không cần Worker)
+// User GET từ R2 custom domain (CF CDN cached → FREE egress)
+const R2_ACCESS_KEY = Deno.env.get("R2_ACCESS_KEY_ID") || '';
+const R2_SECRET_KEY = Deno.env.get("R2_SECRET_ACCESS_KEY") || '';
+const R2_ENDPOINT = Deno.env.get("R2_ENDPOINT") || ''; // https://{account_id}.r2.cloudflarestorage.com
+const R2_BUCKET = Deno.env.get("R2_BUCKET") || 'stream-cache';
+const R2_PUBLIC_URL = Deno.env.get("R2_PUBLIC_URL") || ''; // https://r2.vnhell.com (custom domain)
+const R2_ENABLED = !!(R2_ACCESS_KEY && R2_SECRET_KEY && R2_ENDPOINT);
+
 // Set of keys known to exist in R2 (avoids HEAD requests)
 const r2KnownKeys = new Set<string>();
 let r2Uploads = 0;
 let r2Hits = 0;
+let r2Errors = 0;
 
 // ====== IN-MEMORY SEGMENT CACHE (L1) ======
 // Cache segments from 321watch to reduce upstream requests
@@ -33,10 +40,10 @@ let cacheEvictions = 0;
 
 function getCacheKey(url: string): string {
   // Extract the unique segment path from 321watch URL
-  // e.g., https://xx.321watch.workers.dev/s/HASH → /s/HASH
+  // e.g., https://xx.321watch.workers.dev/s/HASH → s/HASH (without leading /)
   try {
     const u = new URL(url);
-    return u.pathname; // /s/HASH is unique per segment
+    return u.pathname.replace(/^\//, ''); // remove leading / for R2 key
   } catch {
     return url;
   }
@@ -87,30 +94,99 @@ const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-api-key, x-proxy-key',
-  'Access-Control-Max-Age': '86400', // Cache CORS preflight 24h → reduce 50% CF requests
+  'Access-Control-Max-Age': '86400', // Cache CORS preflight 24h → reduce 50% requests
 }
 
-// ====== R2 HELPER FUNCTIONS ======
+// ====== R2 S3 API — AWS Signature V4 ======
+async function hmacSha256(key: ArrayBuffer | Uint8Array, message: string): Promise<ArrayBuffer> {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  return crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(message));
+}
+
+async function sha256Hex(data: Uint8Array): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function s3SignedHeaders(method: string, path: string, contentType: string, bodyHash: string): Promise<Record<string, string>> {
+  const now = new Date();
+  const dateStamp = now.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+  const shortDate = dateStamp.slice(0, 8);
+  const region = 'auto'; // R2 uses 'auto'
+  const service = 's3';
+  const scope = `${shortDate}/${region}/${service}/aws4_request`;
+  
+  // Parse endpoint to get host
+  const endpointUrl = new URL(R2_ENDPOINT);
+  const host = endpointUrl.host;
+  
+  // Canonical headers
+  const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
+  const canonicalHeaders = [
+    `content-type:${contentType}`,
+    `host:${host}`,
+    `x-amz-content-sha256:${bodyHash}`,
+    `x-amz-date:${dateStamp}`,
+  ].join('\n') + '\n';
+  
+  // Canonical request
+  const canonicalRequest = [
+    method, `/${R2_BUCKET}/${path}`, '', canonicalHeaders, signedHeaders, bodyHash
+  ].join('\n');
+  
+  const canonicalRequestHash = await sha256Hex(new TextEncoder().encode(canonicalRequest));
+  
+  // String to sign
+  const stringToSign = `AWS4-HMAC-SHA256\n${dateStamp}\n${scope}\n${canonicalRequestHash}`;
+  
+  // Signing key
+  const kDate = await hmacSha256(new TextEncoder().encode(`AWS4${R2_SECRET_KEY}`), shortDate);
+  const kRegion = await hmacSha256(kDate, region);
+  const kService = await hmacSha256(kRegion, service);
+  const kSigning = await hmacSha256(kService, 'aws4_request');
+  
+  const signature = [...new Uint8Array(await hmacSha256(kSigning, stringToSign))]
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+  
+  return {
+    'Authorization': `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    'x-amz-date': dateStamp,
+    'x-amz-content-sha256': bodyHash,
+    'Content-Type': contentType,
+    'Cache-Control': 'public, max-age=604800', // 7 days CDN cache
+  };
+}
+
+// Upload segment to R2 via S3 PUT (non-blocking, background)
 async function r2Upload(key: string, data: Uint8Array, contentType: string): Promise<boolean> {
-  if (!R2_WORKER_URL) return false;
+  if (!R2_ENABLED) return false;
   try {
-    const resp = await fetch(`${R2_WORKER_URL}/${key}`, {
+    const bodyHash = await sha256Hex(data);
+    const headers = await s3SignedHeaders('PUT', key, contentType, bodyHash);
+    
+    const resp = await fetch(`${R2_ENDPOINT}/${R2_BUCKET}/${key}`, {
       method: 'PUT',
-      headers: { 'X-Auth': API_KEY, 'Content-Type': contentType },
+      headers,
       body: data,
     });
+    
     if (resp.ok) {
       r2KnownKeys.add(key);
       r2Uploads++;
       return true;
     }
-  } catch { /* ignore R2 upload failures — memory cache still works */ }
+    r2Errors++;
+  } catch {
+    r2Errors++;
+  }
   return false;
 }
 
-function getR2Url(key: string): string | null {
-  if (!R2_WORKER_URL || !r2KnownKeys.has(key)) return null;
-  return `${R2_WORKER_URL}/${key}`;
+function getR2PublicUrl(key: string): string | null {
+  if (!R2_PUBLIC_URL || !r2KnownKeys.has(key)) return null;
+  return `${R2_PUBLIC_URL}/${key}`;
 }
 
 Deno.serve(async (req: Request) => {
@@ -158,11 +234,12 @@ Deno.serve(async (req: Request) => {
               : '0%',
           },
           L2_r2: {
-            enabled: !!R2_WORKER_URL,
-            workerUrl: R2_WORKER_URL || 'not configured',
+            enabled: R2_ENABLED,
+            publicUrl: R2_PUBLIC_URL || 'not configured',
             knownKeys: r2KnownKeys.size,
             uploads: r2Uploads,
             hits: r2Hits,
+            errors: r2Errors,
           },
         }
       }, null, 2), { 
@@ -175,11 +252,11 @@ Deno.serve(async (req: Request) => {
     headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     headers.set("Accept", "application/json, text/html, */*");
 
-    // ====== CHECK CACHE for segments (L1 Memory → L2 R2 → Origin) ======
+    // ====== CHECK CACHE for segments (L1 Memory → L2 R2 CDN → Origin) ======
     if (isSegmentUrl(targetUrl)) {
       const cacheKey = getCacheKey(targetUrl);
       
-      // L1: Check memory cache
+      // L1: Check memory cache (fastest, < 1ms)
       const cached = cacheGet(cacheKey);
       if (cached) {
         cacheHits++;
@@ -197,8 +274,8 @@ Deno.serve(async (req: Request) => {
         });
       }
       
-      // L2: Redirect to R2 if known (CDN cached → 0 BW on this VPS)
-      const r2Url = getR2Url(cacheKey);
+      // L2: Redirect to R2 CDN domain (0 BW on VPS, CF CDN serves)
+      const r2Url = getR2PublicUrl(cacheKey);
       if (r2Url) {
         r2Hits++;
         return Response.redirect(r2Url, 302);
@@ -252,7 +329,7 @@ Deno.serve(async (req: Request) => {
             const cacheKey = getCacheKey(targetUrl);
             cachePut(cacheKey, data, contentType);
             
-            // L2: Upload to R2 in background (non-blocking)
+            // L2: Upload to R2 in background (non-blocking, won't slow response)
             r2Upload(cacheKey, data, contentType);
             
             responseHeaders.set('X-Cache', 'MISS');
