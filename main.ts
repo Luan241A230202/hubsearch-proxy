@@ -78,6 +78,7 @@ const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-api-key, x-proxy-key',
+  'Access-Control-Max-Age': '86400', // Cache CORS preflight 24h → reduce 50% CF requests
 }
 
 Deno.serve(async (req: Request) => {
