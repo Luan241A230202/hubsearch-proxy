@@ -22,7 +22,7 @@ npx wrangler deploy
 ```
 
 ## Sau khi deploy
-Copy Worker URL (vd: `https://proxy-vps-edge.zohup-com.workers.dev`) và paste vào:
+Copy Worker URL (vd: `https://proxy-vps-edge.phephim.workers.dev`) và paste vào:
 - `avdb-player.html` → biến `CF_EDGE`
 
 ## Files
