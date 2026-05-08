@@ -7,7 +7,7 @@ const API_KEY = Deno.env.get("PROXY_API_KEY") || "VIP_KHOABAM_999";
 // - Max 150 entries (~300MB RAM max assuming ~2MB/segment)
 // - TTL: 2 hours (segments don't change)
 // - LRU eviction: oldest entries removed first
-const CACHE_MAX_ENTRIES = 150;
+const CACHE_MAX_ENTRIES = 500;
 const CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 interface CacheEntry {
