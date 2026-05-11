@@ -7,9 +7,9 @@ const API_KEY = Deno.env.get("PROXY_API_KEY") || "VIP_KHOABAM_999";
 // User GET từ R2 custom domain (CF CDN cached → FREE egress)
 const R2_ACCESS_KEY = Deno.env.get("R2_ACCESS_KEY_ID") || '';
 const R2_SECRET_KEY = Deno.env.get("R2_SECRET_ACCESS_KEY") || '';
-const R2_ENDPOINT = Deno.env.get("R2_ENDPOINT") || ''; // https://{account_id}.r2.cloudflarestorage.com
-const R2_BUCKET = Deno.env.get("R2_BUCKET") || 'stream-cache';
-const R2_PUBLIC_URL = Deno.env.get("R2_PUBLIC_URL") || ''; // https://r2.vnhell.com (custom domain)
+const R2_ENDPOINT = Deno.env.get("R2_ENDPOINT") || 'https://a58d6a01ea612aa2cc14b1594e642d5b.r2.cloudflarestorage.com';
+const R2_BUCKET = Deno.env.get("R2_BUCKET") || 'streams-cache';
+const R2_PUBLIC_URL = Deno.env.get("R2_PUBLIC_URL") || 'https://r2.zohup.net';
 const R2_ENABLED = !!(R2_ACCESS_KEY && R2_SECRET_KEY && R2_ENDPOINT);
 
 // Set of keys known to exist in R2 (avoids HEAD requests)
