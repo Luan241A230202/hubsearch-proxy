@@ -281,6 +281,22 @@ Deno.serve(async (req: Request) => {
         return Response.redirect(r2Url, 302);
       }
       
+      // L2-fallback: Key not in memory set (e.g. after restart)
+      // Check R2 via HEAD on public domain — if exists, redirect
+      if (R2_PUBLIC_URL && !r2KnownKeys.has(cacheKey)) {
+        try {
+          const headResp = await fetch(`${R2_PUBLIC_URL}/${cacheKey}`, {
+            method: 'HEAD',
+            signal: AbortSignal.timeout(3000), // 3s timeout
+          });
+          if (headResp.ok) {
+            r2KnownKeys.add(cacheKey); // Remember for next time
+            r2Hits++;
+            return Response.redirect(`${R2_PUBLIC_URL}/${cacheKey}`, 302);
+          }
+        } catch { /* R2 not available, fall through to origin */ }
+      }
+      
       cacheMisses++;
     }
 
