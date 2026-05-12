@@ -332,7 +332,7 @@ Deno.serve(async (req: Request) => {
         }
         responseHeaders.set('Content-Type', contentType);
         
-        // For segments: collect output, cache in L1 (memory) + L2 (R2)
+        // For segments: buffer full output, cache L1+L2, then respond
         if (isSegmentUrl(targetUrl)) {
           const output = await child.output();
           const data = output.stdout;
@@ -342,7 +342,7 @@ Deno.serve(async (req: Request) => {
             const cacheKey = getCacheKey(targetUrl);
             cachePut(cacheKey, data, contentType);
             
-            // L2: Upload to R2 in background (non-blocking, won't slow response)
+            // L2: Upload to R2 in background (non-blocking)
             r2Upload(cacheKey, data, contentType);
             
             responseHeaders.set('X-Cache', 'MISS');
