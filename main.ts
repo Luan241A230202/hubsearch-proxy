@@ -275,10 +275,19 @@ Deno.serve(async (req: Request) => {
       }
       
       // L2: Redirect to R2 CDN domain (0 BW on VPS, CF CDN serves)
+      // MUST include CORS headers on 302 — otherwise browser blocks cross-origin redirect!
       const r2Url = getR2PublicUrl(cacheKey);
       if (r2Url) {
         r2Hits++;
-        return Response.redirect(r2Url, 302);
+        return new Response(null, {
+          status: 302,
+          headers: {
+            'Location': r2Url,
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, OPTIONS',
+            'Cache-Control': 'public, max-age=7200',
+          },
+        });
       }
       
       // L2-fallback: Key not in memory set (e.g. after restart)
